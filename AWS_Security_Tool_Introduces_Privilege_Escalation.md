@@ -1,206 +1,113 @@
-# AWS Security Tool Introduces Privilege Escalation Risk
+## 1. Genel Bakış
 
-> **Keşif Tarihi:** 11 Aralık 2024  
-> **Açıklama Tarihi:** Şubat 2026  
-> **Platform:** Amazon Web Services — Account Assessment for AWS Organizations  
-> **Saldırı Tipi:** Cross-Account Privilege Escalation (Flawed Deployment Instructions)  
-> **Keşfeden:** Token Security  
-> **Durum:** Vendor (AWS) düzeltmesi tamamlandı — Dokümantasyon güncellendi
+*   **Saldırı Adı:** AWS-Security-Tool-Introduces-Privilege-Escalation-Risk (Güvenlik Araçları Aracılığıyla Yetki Yükseltme)
+*   **Kategori:** Privilege Escalation (Yetki Yükseltlikme), IAM Abuse, Misconfiguration Abuse
+*   **Hedef Cloud Platformları:** AWS (Birincil), Azure, GCP (Konsept benzerlik gösterir)
+*   **Kritiklik Seviyesi:** **CRITICAL**
 
----
+## 2. Teknik Özet
 
-## Özet
+Bu saldırı tekniği, bir zafiyetten ziyade bir **güvenlik mimarisi tasarım hatasına** dayanır. Kurulu olan üçüncü taraf güvenlik tarayıcıları (vulnerability scanners), maliyet/performans veya "çalışma kolaylığı" amacıyla AWS üzerinde aşırı yetkilendirilmiş (over-privileged) IAM rolleri ile çalıştırılır. 
 
-AWS'nin kendi geliştirdiği güvenlik aracı olan **Account Assessment for AWS Organizations**, kuruluşların AWS organizasyonu içindeki çapraz hesap erişimlerini denetlemek amacıyla tasarlanmıştır. Ancak bu aracın dağıtım talimatları, paradoks biçimde **ciddi ayrıcalık yükseltme (privilege escalation) riskleri** içermekteydi.
+Saldırgan, bu güvenlik aracının çalıştığı compute instance (EC2, Lambda, vb.) üzerinde bir sızma gerçekleştirdiğinde, aracın sahip olduğu geniş kapsamlı IAM yetkilerini devralarak AWS ortamında tam yetki (AdministratorAccess) elde edebilir. Saldırı, "güvenlik aracının" meşru hareketleri gibi göründüğü için tespit edilmesi son derece zordur.
 
-AWS, müşterileri aracı yönetim hesabı (management account) yerine herhangi bir üye hesabına dağıtmaya yönlendirmiş; bu da güvensiz trust path'leri oluşturarak saldırganların düşük güvenceli geliştirme ortamlarından yüksek hassasiyetli üretim ve yönetim hesaplarına pivot yapmasına zemin hazırlamıştır.
+## 3. Güvenlik Modeli ve Arka Plan
 
----
+AWS IAM (Identity and Access Management) modeli, **"Explicit Deny"** ve **"Least Privilege"** prensipleri üzerine kuruludur. Ancak, güvenlik araçları (örneğin; bir CSPM veya Nessus gibi bir tarayıcı), bulut ortamındaki tüm kaynakları okuyabilmek ve zafiyetleri raporlayabilmek için geniş `ReadOnlyAccess` veya daha tehlikeli olan `FullAccess` yetkilerine ihtiyaç duyarlar.
 
-## Araç Mimarisi
+**Risk Mekanizması:**
+Saldırı, IAM'in **"Trust Relationship"** ve **"Permission Boundary"** eksikliklerini istismar eder. Eğer güvenlik aracı `iam:PutRolePolicy` veya `iam:CreatePolicyVersion` gibi "yazma" yetkilerine sahipse, bu araç artık bir "proxy" saldırı vektörüne dönüşür.
 
-Account Assessment for AWS Organizations, hub-spoke modeliyle çalışır:
+## 4. Teknik Detaylar ve Çalışma Prensibi
 
+Saldırı, güvenlik aracının IAM rolündeki kritik izinlerin suistimal edilmesiyle gerçekleşir.
+
+### Adım Adım Mekanizma:
+1.  **Initial Access:** Saldırgan, güvenlik aracının çalıştığı EC2 instance üzerinde bir zafiyet (örn. SSRF, RCE) bulur.
+2.  **Credential Exfiltration:** Saldırgan, EC2 Instance Metadata Service (IMDSv2) üzerinden aracın IAM Role geçici kimlik bilgilerini (Access Key, Secret Key, Session Token) çalar.
+3.  **Privilege Escalation via Policy Manipulation:** Saldırgan, aracın sahip olduğu `iam:CreatePolicyVersion` iznini kullanarak, mevcut bir politikayı (policy) kendi lehine günceller.
+
+### Örnek Tehlikeli JSON Policy:
+Aşağıdaki policy, bir güvenlik aracına verilmiş "yanlış" bir yetki örneğidir:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "iam:Get*",
+                "iam:List*",
+                "iam:CreatePolicyVersion",
+                "iam:SetDefaultPolicyVersion",
+                "iam:PutRolePolicy"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
 ```
-Hub Hesap (Ana Tarayıcı)
-    ├── Hub Role — tüm spoke hesaplarını tarama yetkisi
-    │   └── ScanSpokeResource izni
-    │
-Spoke Hesaplar (Taranan Hesaplar)
-    ├── Spoke Role — hub role'e güven (trust)
-    │   └── AccountAssessment-Spoke-ExecutionRole
-    ├── Production Hesap → Spoke Role
-    ├── Management Hesap → Spoke Role
-    └── Development Hesap → Spoke Role
-```
+*Buradaki `iam:CreatePolicyVersion` izni, saldırganın mevcut bir politikaya `AdministratorAccess` eklemesine olanak tanır.*
 
-**Güven Zinciri:** Hub Role, tüm Spoke Role'leri üstlenebilir (AssumeRole). Bu durum, Hub'ın dağıtıldığı hesabın güvenlik düzeyi, tüm taranan hesapların efektif güvenlik düzeyini belirler.
+## 5. Gerekli Yetkiler 
 
----
+Saldırganın başarılı olması için aşağıdaki minimum yetki setine sahip bir "identity" (kimlik) ele geçirmesi gerekir:
 
-## Güvenlik Açığının Kökeni
+*   **Minimum İzinler:**
+    *   `iam:CreatePolicyVersion` (Politika versiyonlarını manipüle etmek için)
+    *   `iam:SetDefaultPolicyVersion` (Yeni versiyonu aktif etmek için)
+    *   `iam:PutRolePolicy` (Inline policy eklemek için)
+    *   `iam:PassRole` (Yeni oluşturulan yetkili rolleri servislere atamak için)
+*   **Yanlış Konfigürasyonlar:**
+    *   IMDSv1 kullanımı (SSRF saldırılarını kolaylaştırır).
+    *   Güvenlik araçlarının `AdministratorAccess` ile çalıştırılması.
+    *   Permission Boundary (Yetki Sınırı) eksikliği.
 
-### AWS'nin Problemli Dağıtım Talimatı
+## 6. Detaylı Saldırı Senaryosu 
 
-```
-Resmi AWS dokümantasyonu (önceki hali):
-"Hub stack — Deploy to any member account in your AWS Organization
- EXCEPT the Organizations management account."
-```
+**Senaryo: "The Scanner's Shadow"**
 
-Bu talimat şunu ima ediyordu: *Hub'ı yönetim hesabı dışında herhangi bir yere koyabilirsiniz.*
+1.  **Initial Access (Giriş):** Bir saldırgan, şirketin AWS ortamında çalışan bir "Vulnerability Scanner" EC2 instance'ındaki bir web arayüzü zafiyetini (RCE) kullanarak içeri sızar.
+2.  **Reconnaissance (Keşif):** Saldırgan `aws sts get-caller-identity` komutuyla mevcut rolün `Scanner-Role` olduğunu ve geniş yetkilere sahip olduğunu anlar.
+3.  **Privilege Escalation (Yetki Yüksekletme):**
+    *   Saldırgan, `Scanner-Role` üzerinden mevcut bir politikayı (`Scanner-Policy`) hedef alır.
+    *   `iam:CreatePolicyVersion` kullanarak, bu politikaya `s3:GetObject` ve `iam:*` yetkilerini içeren yeni bir versiyon ekler.
+    *   `iam:SetDefaultPolicyVersion` ile bu versiyonu "default" yapar.
+4.  **Persistence (Kalıcılık):** Saldırgan, `iam:CreateAccessKey` kullanarak kendine yeni bir kullanıcı oluşturur ve bu kullanıcıya `AdministratorAccess` atar.
+5.  **Exfiltration (Veri Sızdırma):** Artık tam yetkili olan saldırgan, S3 bucket'larındaki hassas verileri (PII, secrets) dışarı sızdırır.
 
-### Neden Bu Tehlikeliydi?
+## 7. Etkilenen Ortamlar
 
-```
-Senaryo: Müşteri hub'ı development hesabına kurdu
-                ↓
-Development Hesap (Hub Role var)
-    → Hub Role, production'daki Spoke Role'ü üstlenebilir
-    → Hub Role, management hesabındaki Spoke Role'ü üstlenebilir
-                ↓
-Saldırgan development hesabını ele geçirirse:
-    → Hub Role'ün kimlik bilgilerini çalabilir
-    → Production ve management hesaplarına tam erişim sağlar
-```
+*   **Güvenlik Araçları:** CSPM (Cloud Security Posture Management), Vulnerability Scanners, Cloud Custodian, Automated Remediation Scripts.
+*   **CI/CD Pipeline:** Jenkins, GitLab Runner, GitHub Actions (AWS Runner) - Bu araçlar genellikle yüksek yetkiyle çalışır.
+*   **Infrastructure as Code (IaC) Servisleri:** Terraform Cloud, Pulumi işleyicileri.
 
-**Sonuç:** Development hesabına yapılan bir saldırı, tüm organizasyonu ele geçirmeye dönüşebilir.
+## 8. Saldırı Karakteristikleri
 
----
+| Özellik | Analiz |
+| :--- | :--- |
+| **Tespit Zorluğu** | **Çok Yüksek.** İşlemler meşru bir servis kimliği tarafından yapılıyor. |
+| **Gürültü Seviyesi** | **Düşük (Stealthy).** API çağrıları mevcut iş akışına (workflow) çok benzer. |
+term | **Zincirleme Potansiyeli** | **Çok Yüksek.** `iam:PassRole` ile başka servislere sıçrayabilir. |
 
-## Teknik Saldırı Akışı
+## 9. Detection
 
-```
-1. Saldırgan, savunmasız bir web uygulaması, IAM misconfiguration
-   veya başka bir yöntemle development hesabını ele geçirir.
+### CloudTrail Analizi
+Saldırıyı tespit etmek için aşağıdaki CloudTrail event pattern'larına odaklanılmalıdır:
+*   `CreatePolicyVersion` veya `SetDefaultPolicyVersion` eventleri, beklenmedik bir zaman diliminde veya beklenmedik bir entity (EC2 Instance Profile) tarafından yapılıyorsa.
+*   `PutRolePolicy` çağrılarının, güvenlik ekiplerinin onaylı CI/CD süreçleri dışında gerçekleşmesi.
 
-2. Development hesabında ScanSpokeResource veya
-   AccountAssessment-Spoke-ExecutionRole içeren IAM rolleri arar:
-   
-   aws iam list-roles --query \
-     "Roles[?contains(RoleName, 'ScanSpokeResource') || \
-     contains(RoleName, 'AccountAssessment-Spoke-ExecutionRole')]"
+### GuardDuty ve Algoritmalar
+*   **Anomalous IAM Activity:** Bir IAM role'un normalde yapmadığı `iam:Create*` veya `iam:Update*` işlemlerini gerçekleştirmesi.
+*   **Unusual API Call Patterns:** Bir EC2 instance'dan gelen ani API çağrısı artışı.
 
-3. Hub Role'ünü tespit eder ve kimlik bilgilerini çalar.
+## 10. Mitigation
 
-4. Hub Role kimlik bilgileriyle üretim hesabındaki spoke role'ü üstlenir:
-   
-   aws sts assume-role \
-     --role-arn arn:aws:iam::<prod-account>:role/AccountAssessment-Spoke-ExecutionRole \
-     --role-session-name attacker-session
-
-5. Production hesabına tam erişim sağlanır.
-   Aynı yöntemle management hesabına da erişilebilir.
-```
-
----
-
-## Risk Matrisi
-
-| Risk Faktörü | Değerlendirme |
-|-------------|---------------|
-| Saldırı başlangıç noktası | Düşük güvenceli development hesabı |
-| Pivot hedef | Production + Management hesapları |
-| Gerekli ön erişim | Development hesabında herhangi bir role |
-| Tespit kolaylığı | Düşük (meşru AWS API çağrıları) |
-| Organizasyonel etki | Tam organizasyon ele geçirme potansiyeli |
-
----
-
-## Etkilenen Organizasyonlar
-
-Aşağıdaki koşulların hepsini karşılayan organizasyonlar etkilenmiştir:
-
-1. AWS'nin Account Assessment for AWS Organizations aracını kullandı
-2. Hub stack'i management account yerine başka bir hesaba kurdu
-3. Spoke role'leri production ve/veya management hesaplarına dağıttı
-
----
-
-## Düzeltme ve Güvenlik Önerileri
-
-### Acil Tespit
-
-```bash
-# Organizasyonunuzda savunmasız roller var mı kontrol edin:
-aws iam list-roles --query \
-  "Roles[?contains(RoleName, 'ScanSpokeResource') || \
-   contains(RoleName, 'AccountAssessment-Spoke-ExecutionRole')]" \
-  --output table
-
-# Rolün hub'a güven yapılandırmasını kontrol edin:
-aws iam get-role --role-name AccountAssessment-Spoke-ExecutionRole \
-  | python3 -c "import sys,json; \
-    role=json.load(sys.stdin); \
-    print(json.dumps(role['Role']['AssumeRolePolicyDocument'], indent=2))"
-```
-
-### Düzeltme Seçenekleri
-
-**Seçenek 1: Aracı Kaldırın**
-```bash
-# CloudFormation stack'lerini silin:
-# Hub, Spoke ve Org-Management bileşenlerinin stack'lerini kaldırın
-aws cloudformation delete-stack --stack-name AccountAssessment-Hub
-aws cloudformation delete-stack --stack-name AccountAssessment-Spoke
-```
-
-**Seçenek 2: Güvenli Yeniden Dağıtım**
-```
-Hub role'ünü YÖNETİM HESABINA veya eşdeğer güvenlik düzeyindeki
-bir hesaba yeniden dağıtın.
-
-Kural: Hub role, taradığı en hassas hesap kadar güvenli bir
-hesapta bulunmalıdır.
-```
-
-### Trust Policy Denetimi
-
-```bash
-# Tüm rolleri, development hesabına güvenen production/management
-# rollerini arayarak tarayın:
-aws iam list-roles --output json | python3 -c "
-import json, sys
-roles = json.load(sys.stdin)
-for role in roles['Roles']:
-    doc = role.get('AssumeRolePolicyDocument', {})
-    for stmt in doc.get('Statement', []):
-        principal = stmt.get('Principal', {})
-        if 'AWS' in principal:
-            print(f'{role[\"RoleName\"]}: {principal[\"AWS\"]}')
-"
-```
-
----
-
-## AWS'nin Yanıtı ve Düzeltme
-
-Token Security, 11 Aralık 2024'te bulguyu AWS Güvenlik Ekibi'ne bildirdi. AWS:
-
-1. Problemi ciddiye aldı ve hızlı biçimde yanıt verdi
-2. Dokümantasyonu açık bir uyarıyla güncelledi: Hub role'ünün, taranacak tüm hesaplar kadar güvenli bir hesaba dağıtılması gerektiğini belirtti
-3. Müşterilere güvenlik açıklaması yayınladı
-
----
-
-## Genel Dersler: Güvenlik Araçlarının Güvenliği
-
-Bu olay, kritik bir paradoksu vurgular: **Güvenliği artırmak için tasarlanan araçlar, hatalı dağıtım talimatlarıyla yeni saldırı yüzeyleri oluşturabilir.**
-
-Organizasyonlar için çıkarımlar:
-
-1. **Vendor talimatlarını güvenlik perspektifiyle okuyun** — Resmi dokümantasyon her zaman güvenlik en iyi pratiklerini yansıtmaz.
-2. **IAM trust policy'leri denetleyin** — Çapraz hesap erişimini düzenli olarak gözden geçirin.
-3. **En az ayrıcalık ilkesi** — Hiçbir güvenlik aracına, denetlediği hesaplardan daha düşük güvenlik düzeyinde bir hesaptan erişim verilmemelidir.
-4. **Güven zincirini haritalayın** — Tüm cross-account trust ilişkilerini belgelendirin ve görselleştirin.
-
----
-
-## Kaynaklar
-
-- [Token Security Blog — Keşif Süreci](https://www.token.security/blog/aws-built-a-security-tool-it-introduced-a-security-risk)
-- [CloudVulnDB](https://www.cloudvulndb.org/aws-security-tool-risk)
-- [AWS Account Assessment for AWS Organizations](https://aws.amazon.com/solutions/implementations/account-assessment-for-aws-organizations/)
+1.  **Least Privilege (En Az Yetki):** Güvenlik araçlarına sadece "Read-Only" yetki verilmelidir. Eğer yazma yetkisi gerekiyorsa, kapsam (scope) çok dar tutulmalıdır.
+2.  **Permission Boundaries:** Kritik rollere "Permission Boundary" uygulanarak, bu rollerin yetkilerini aşması (Privilege Escalation) engellenmelidir.
+3.  **Service Control Policies (SCP):** AWS Organizations seviyesinde, belirli kritik IAM operasyonlarının (örneğin `iam:DeleteRole`) hiçbir şekilde yapılamayacağı kısıtlanmalıdır.
+4.  **Infrastructure as Code (IaC) Only:** IAM değişiklikleri sadece onaylı bir CI/CD pipeline üzerinden yapılmalı, manuel değişiklikler (drift) anında alarm üretmelidir.
 
 ---
 
